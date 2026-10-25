@@ -13,6 +13,7 @@ package mongo
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -26,6 +27,17 @@ type Config struct {
 	DBName         string
 	ConnectTimeout time.Duration
 	PingTimeout    time.Duration
+
+	// RetryAttempts — số lần ping tối đa khi khởi động (0 = dùng default 10).
+	// LÝ DO: sau REBOOT, Docker start lại container CŨ (restart: unless-stopped)
+	// TRƯỚC khi Mongo init xong — `depends_on:` của compose KHÔNG áp dụng cho
+	// lần restart đó. Ping 1 lần rồi trả lỗi => main() log.Fatalf => container
+	// exit => restart loop. Đã trúng thật ở platform-api (P35) và dashboard/
+	// tempmail (P36). Đo thực tế: Mongo cần ~30s sau reboot.
+	RetryAttempts int
+	// RetryDelay — thời gian chờ giữa 2 lần ping (0 = 3s).
+	// 10 × 3s = 30s, khớp thời gian Mongo cần sau reboot.
+	RetryDelay time.Duration
 }
 
 // Client — wrapper giữ *mongo.Client + Database.
@@ -34,7 +46,32 @@ type Client struct {
 	DB *mongo.Database
 }
 
-// Connect mở kết nối, ping, trả Client. Caller PHẢI gọi Disconnect.
+// Hằng số retry mặc định — tách ra để test chốt được (retry_test.go).
+const (
+	defaultRetryAttempts = 10
+	defaultRetryDelay    = 3 * time.Second
+)
+
+// applyDefaults điền giá trị mặc định cho các field bằng 0.
+func applyDefaults(cfg *Config) {
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = 10 * time.Second
+	}
+	if cfg.PingTimeout == 0 {
+		cfg.PingTimeout = 5 * time.Second
+	}
+	if cfg.RetryAttempts == 0 {
+		cfg.RetryAttempts = defaultRetryAttempts
+	}
+	if cfg.RetryDelay == 0 {
+		cfg.RetryDelay = defaultRetryDelay
+	}
+	if cfg.RetryAttempts < 1 {
+		cfg.RetryAttempts = 1
+	}
+}
+
+// Connect mở kết nối, ping (có RETRY), trả Client. Caller PHẢI gọi Disconnect.
 func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.URI == "" {
 		return nil, fmt.Errorf("mongo: URI rỗng")
@@ -42,12 +79,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DBName == "" {
 		return nil, fmt.Errorf("mongo: DBName rỗng")
 	}
-	if cfg.ConnectTimeout == 0 {
-		cfg.ConnectTimeout = 10 * time.Second
-	}
-	if cfg.PingTimeout == 0 {
-		cfg.PingTimeout = 5 * time.Second
-	}
+	applyDefaults(&cfg)
 
 	opts := options.Client().
 		ApplyURI(cfg.URI).
@@ -59,11 +91,32 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("mongo: connect: %w", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, cfg.PingTimeout)
-	defer cancel()
-	if err := mc.Ping(pingCtx, nil); err != nil {
+	var lastErr error
+	for attempt := 1; attempt <= cfg.RetryAttempts; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, cfg.PingTimeout)
+		pingErr := mc.Ping(pingCtx, nil)
+		cancel()
+		if pingErr == nil {
+			if attempt > 1 {
+				log.Printf("[mongo] connected sau %d lan thu", attempt)
+			}
+			lastErr = nil
+			break
+		}
+		lastErr = pingErr
+		if attempt < cfg.RetryAttempts {
+			log.Printf("[mongo] ping fail (lan %d/%d): %v — cho %s", attempt, cfg.RetryAttempts, pingErr, cfg.RetryDelay)
+			select {
+			case <-ctx.Done():
+				_ = mc.Disconnect(context.Background())
+				return nil, fmt.Errorf("mongo: ping bi huy: %w", ctx.Err())
+			case <-time.After(cfg.RetryDelay):
+			}
+		}
+	}
+	if lastErr != nil {
 		_ = mc.Disconnect(context.Background())
-		return nil, fmt.Errorf("mongo: ping: %w", err)
+		return nil, fmt.Errorf("mongo: ping sau %d lan thu: %w", cfg.RetryAttempts, lastErr)
 	}
 
 	return &Client{Client: mc, DB: mc.Database(cfg.DBName)}, nil
