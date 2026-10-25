@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Go 1.22 la minimum theo go.mod; 1.26 la ban dang dung production.
+        go: ["1.22", "1.26"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify module path
+        run: |
+          ACTUAL=$(head -1 go.mod | awk '{print $2}')
+          EXPECTED="github.com/QDung310/destiny-go-pkg"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::go.mod khai module=$ACTUAL, can=$EXPECTED"
+            exit 1
+          fi
+          echo "module path OK: $ACTUAL"
+
+      - name: No stale imports
+        run: |
+          # Bai hoc P24: doi module path nhung quen import noi bo ->
+          # consumer bao "no required module provides package".
+          if grep -rn "github.com/destiny/pkg\|evox1.isthe.top" --include="*.go" .; then
+            echo "::error::con import module path cu"
+            exit 1
+          fi
+          echo "khong con import cu"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # -count=1: khong dung cache. -race: phat hien data race (auth/revoke
+        # dung map + mutex, race se lo ra o day chu khong o may dev).
+        run: go test ./... -count=1 -race -v 2>&1 | tail -60
+
+  # Kiem tra "fitness": khong ai duoc them code ky JWT vao pkg/auth (ADR-002).
+  fitness-adr002:
+    name: Fitness — pkg/auth khong duoc ky JWT
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Test
+        # pkg/auth co fitness test rieng (TestPkgAuthCannotSign) — chay no.
+        run: go test ./auth -run "TestPackageCannotSignTokens" -v
+
+  # Chi chay khi push TAG: verify module reachable tu ngoai (nhu consumer that).
+  verify-published:
+    name: Verify module reachable
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: go get tu tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "verify github.com/QDung310/destiny-go-pkg@$TAG"
+          mkdir -p /tmp/verify && cd /tmp/verify
+          printf "module verify\n\ngo 1.22\n" > go.mod
+          # GOPROXY=direct + GIT_TERMINAL_PROMPT=0: neu repo private thi FAIL,
+          # dung nhu consumer that se gap.
+          GOPROXY=direct GOSUMDB=off GIT_TERMINAL_PROMPT=0 \
+            go get "github.com/QDung310/destiny-go-pkg@$TAG"
+          echo "::notice::module reachable: $TAG"
